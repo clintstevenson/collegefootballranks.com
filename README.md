@@ -1,0 +1,1 @@
+# collegefootballranks.com
