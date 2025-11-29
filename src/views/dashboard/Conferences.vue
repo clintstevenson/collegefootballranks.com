@@ -6,23 +6,21 @@ const error = ref(null)
 
 const teamsRaw = ref([])
 const rankingsRaw = ref([])
+const allGames = ref([])
 
-// global home-field equal-team win probability from /v1/ranker
-const homeFieldEqualTeamWinProb = ref(null)
+const gamesLoading = ref(false)
+const gamesError = ref(null)
 
 const searchQuery = ref('')
 const selectedConference = ref('ALL')
-const sortKey = ref('team_name')
+const sortKey = ref('conference')
 const sortDirection = ref('asc')
 const currentPage = ref(1)
 const pageSize = ref(25)
 
-// ---- GAMES / MODAL STATE ----
-const showGamesModal = ref(false)
-const selectedTeam = ref(null)
-const gamesLoading = ref(false)
-const gamesError = ref(null)
-const allGames = ref([])
+// ---- MODAL STATE (Conference -> Teams) ----
+const showConferenceModal = ref(false)
+const selectedConferenceName = ref(null)
 
 // ---- API LOAD: TEAMS ----
 async function loadTeams () {
@@ -50,7 +48,7 @@ async function loadTeams () {
   }
 }
 
-// ---- API LOAD: RANKER (rank + SoS + home_field_equal_team_win_prob) ----
+// ---- API LOAD: RANKER (rank) ----
 async function loadRankings () {
   try {
     const res = await fetch('https://api.collegefootballranks.com/v1/ranker', {
@@ -66,13 +64,9 @@ async function loadRankings () {
     const json = await res.json()
     // /v1/ranker returns { raw_ranking: [...] }
     rankingsRaw.value = Array.isArray(json) ? json : (json.raw_ranking || [])
-
-    // capture the global home-field equal-team win probability
-    homeFieldEqualTeamWinProb.value =
-      json.home_field_equal_team_win_prob ?? null
   } catch (err) {
     console.error(err)
-    // keep teams visible even if rankings fail
+    // keep page visible even if rankings fail
   }
 }
 
@@ -105,14 +99,15 @@ async function loadGamesIfNeeded () {
 }
 
 onMounted(() => {
-  // Load teams + rankings together
+  // Load everything needed for conference-level summary
   loadTeams()
   loadRankings()
+  loadGamesIfNeeded()
 })
 
 // ---- LOOKUPS ----
 
-// team_id -> { rank, sos_score }
+// team_id -> { rank }
 const rankingByTeamId = computed(() => {
   const m = new Map()
   rankingsRaw.value.forEach((r) => {
@@ -120,97 +115,217 @@ const rankingByTeamId = computed(() => {
     if (id != null) {
       m.set(id, {
         rank: r.rank ?? null,
-        sos_score: r.sos_score ?? null,
       })
     }
   })
   return m
 })
 
-// Decorate teams with rank + sos_score + home_field_equal_team_win_prob from /v1/ranker
+// teams with rank merged in
 const teamsWithRank = computed(() =>
   teamsRaw.value.map((t) => {
     const r = rankingByTeamId.value.get(t.team_id) || {}
     return {
       ...t,
       rank: r.rank ?? null,
-      sos_score: r.sos_score ?? null,
-      home_field_equal_team_win_prob: homeFieldEqualTeamWinProb.value,
     }
   }),
 )
 
-// map team_id -> team_name for game display
-const teamNameById = computed(() => {
+// team_id -> conference
+const teamConferenceById = computed(() => {
   const m = new Map()
   teamsRaw.value.forEach((t) => {
-    if (t.team_id != null) m.set(t.team_id, t.team_name)
+    if (t.team_id != null && t.conference) {
+      m.set(t.team_id, t.conference)
+    }
   })
   return m
 })
 
-// simple helper: get rank by team_id
-function getTeamRankById (id) {
-  if (id == null) return null
-  const r = rankingByTeamId.value.get(id)
-  return r ? r.rank ?? null : null
+// ---- TEAM-LEVEL GAME STATS (for avg points per game) ----
+const teamGameStats = computed(() => {
+  const stats = new Map() // team_id -> { pointsFor, games }
+
+  function ensureTeam (id) {
+    if (!stats.has(id)) {
+      stats.set(id, { pointsFor: 0, games: 0 })
+    }
+    return stats.get(id)
+  }
+
+  allGames.value.forEach((g) => {
+    const homeId = g.home_team_id
+    const awayId = g.away_team_id
+    const hs = g.home_score ?? g.home_points
+    const as = g.away_score ?? g.away_points
+
+    if (homeId == null || awayId == null) return
+    if (hs == null || as == null) return
+
+    // Home team
+    {
+      const s = ensureTeam(homeId)
+      s.pointsFor += hs
+      s.games += 1
+    }
+
+    // Away team
+    {
+      const s = ensureTeam(awayId)
+      s.pointsFor += as
+      s.games += 1
+    }
+  })
+
+  return stats
+})
+
+function getTeamAvgPoints (teamId) {
+  if (teamId == null) return null
+  const s = teamGameStats.value.get(teamId)
+  if (!s || !s.games) return null
+  return s.pointsFor / s.games
 }
 
-// helper: get SoS score by team_id
-function getTeamSoSById (id) {
-  if (id == null) return null
-  const r = rankingByTeamId.value.get(id)
-  return r ? r.sos_score ?? null : null
-}
+// ---- GAME-BASED CONFERENCE STATS (avg margin vs non-conf) ----
+const conferenceGameStats = computed(() => {
+  const stats = new Map() // conf -> { totalMargin, games }
+
+  function ensureConf (conf) {
+    if (!stats.has(conf)) {
+      stats.set(conf, { totalMargin: 0, games: 0 })
+    }
+    return stats.get(conf)
+  }
+
+  const confById = teamConferenceById.value
+
+  allGames.value.forEach((g) => {
+    const homeId = g.home_team_id
+    const awayId = g.away_team_id
+    const hs = g.home_score ?? g.home_points
+    const as = g.away_score ?? g.away_points
+
+    if (homeId == null || awayId == null) return
+    if (hs == null || as == null) return
+
+    const homeConf = confById.get(homeId)
+    const awayConf = confById.get(awayId)
+    if (!homeConf || !awayConf) return
+
+    // Only consider non-conference matchups
+    if (homeConf === awayConf) return
+
+    // From home conference perspective
+    {
+      const s = ensureConf(homeConf)
+      s.totalMargin += (hs - as)
+      s.games += 1
+    }
+
+    // From away conference perspective
+    {
+      const s = ensureConf(awayConf)
+      s.totalMargin += (as - hs)
+      s.games += 1
+    }
+  })
+
+  return stats
+})
+
+// ---- CONFERENCE AGGREGATION ----
+const conferenceRows = computed(() => {
+  const rows = []
+  const gameStats = conferenceGameStats.value
+  const teamStats = teamGameStats.value
+
+  // Group teams by conference
+  const byConf = new Map()
+  teamsWithRank.value.forEach((t) => {
+    const conf = t.conference || 'Independent'
+    if (!byConf.has(conf)) byConf.set(conf, [])
+    byConf.get(conf).push(t)
+  })
+
+  for (const [conf, teamArr] of byConf.entries()) {
+    const numTeams = teamArr.length
+
+    const ranks = teamArr
+      .map((t) => (typeof t.rank === 'number' ? t.rank : null))
+      .filter((r) => r != null)
+
+    const avgRank =
+      ranks.length > 0
+        ? ranks.reduce((a, b) => a + b, 0) / ranks.length
+        : null
+
+    const gs = gameStats.get(conf)
+    const avgPointDiff =
+      gs && gs.games > 0 ? gs.totalMargin / gs.games : null
+
+    // Average points per game for the conference:
+    // sum(pointsFor for all teams in conf) / sum(games for those teams)
+    let totalPoints = 0
+    let totalGames = 0
+    teamArr.forEach((t) => {
+      const s = teamStats.get(t.team_id)
+      if (s && s.games > 0) {
+        totalPoints += s.pointsFor
+        totalGames += s.games
+      }
+    })
+    const avgPointsFor =
+      totalGames > 0 ? totalPoints / totalGames : null
+
+    rows.push({
+      conference: conf,
+      numTeams,
+      avgRank,
+      avgPointDiff,
+      avgPointsFor,
+    })
+  }
+
+  return rows
+})
 
 // ---- DERIVED METRICS ----
 const totalTeams = computed(() => teamsRaw.value.length)
+const totalConferences = computed(() => conferenceRows.value.length)
 
-const conferences = computed(() => {
-  const set = new Set()
-  teamsRaw.value.forEach((t) => {
-    if (t.conference) set.add(t.conference)
-  })
-  return ['ALL', ...Array.from(set).sort()]
-})
-
-const totalConferences = computed(() => conferences.value.length - 1)
+// For dropdown
+const conferenceOptions = computed(() => [
+  'ALL',
+  ...conferenceRows.value
+    .map((r) => r.conference)
+    .sort((a, b) => a.localeCompare(b)),
+])
 
 // ---- FILTERING & SORTING ----
-const filteredTeams = computed(() => {
+const filteredConferences = computed(() => {
   const q = searchQuery.value.trim().toLowerCase()
-  const conf = selectedConference.value
+  const confFilter = selectedConference.value
 
-  return teamsWithRank.value.filter((team) => {
-    if (conf !== 'ALL' && team.conference !== conf) return false
-
+  return conferenceRows.value.filter((row) => {
+    if (confFilter !== 'ALL' && row.conference !== confFilter) return false
     if (!q) return true
-
-    const haystack = [
-      team.team_name,
-      team.mascot,
-      team.conference,
-    ]
-      .filter(Boolean)
-      .join(' ')
-      .toLowerCase()
-
-    return haystack.includes(q)
+    return row.conference.toLowerCase().includes(q)
   })
 })
 
 const numericSortKeys = new Set([
-  'team_id',
-  'rank',
-  'sos_score',
-  'home_field_equal_team_win_prob',
+  'numTeams',
+  'avgRank',
+  'avgPointDiff',
+  'avgPointsFor',
 ])
 
-const sortedTeams = computed(() => {
+const sortedConferences = computed(() => {
   const key = sortKey.value
   const dir = sortDirection.value
-
-  const arr = [...filteredTeams.value]
+  const arr = [...filteredConferences.value]
 
   arr.sort((a, b) => {
     const aVal = a[key]
@@ -233,13 +348,13 @@ const sortedTeams = computed(() => {
 })
 
 const totalPages = computed(() =>
-  Math.max(1, Math.ceil((sortedTeams.value.length || 1) / pageSize.value)),
+  Math.max(1, Math.ceil((sortedConferences.value.length || 1) / pageSize.value)),
 )
 
-const paginatedTeams = computed(() => {
+const paginatedConferences = computed(() => {
   const start = (currentPage.value - 1) * pageSize.value
   const end = start + pageSize.value
-  return sortedTeams.value.slice(start, end)
+  return sortedConferences.value.slice(start, end)
 })
 
 watch([searchQuery, selectedConference, pageSize], () => {
@@ -266,77 +381,38 @@ function goToPage (page) {
   currentPage.value = page
 }
 
-// ---- MODAL / GAMES HELPERS ----
-function openTeamGames (team) {
-  selectedTeam.value = team
-  showGamesModal.value = true
-  loadGamesIfNeeded()
-}
-
-function closeGamesModal () {
-  showGamesModal.value = false
-}
-
-// Games for selected team
-const selectedTeamGames = computed(() => {
-  if (!selectedTeam.value) return []
-  const id = selectedTeam.value.team_id
-  if (id == null) return []
-  return allGames.value.filter(
-    (g) => g.home_team_id === id || g.away_team_id === id,
-  )
-})
-
-function formatGameDate (game) {
-  const raw = game.game_date || game.date || game.gameDate
-  if (!raw) return '—'
-  const d = new Date(raw)
-  if (Number.isNaN(d.getTime())) return raw
-  return d.toLocaleDateString(undefined, {
-    year: 'numeric',
-    month: 'short',
-    day: 'numeric',
-  })
-}
-
-function getHomeTeamName (game) {
-  const id = game.home_team_id
-  if (id == null) return '—'
-  return teamNameById.value.get(id) || `Team ${id}`
-}
-
-function getAwayTeamName (game) {
-  const id = game.away_team_id
-  if (id == null) return '—'
-  return teamNameById.value.get(id) || `Team ${id}`
-}
-
-// Opposing team SoS (for the selectedTeam in each game)
-function getOpponentSoS (game) {
-  if (!selectedTeam.value) return null
-  const selectedId = selectedTeam.value.team_id
-  if (selectedId == null) return null
-
-  let oppId = null
-  if (game.home_team_id === selectedId) {
-    oppId = game.away_team_id
-  } else if (game.away_team_id === selectedId) {
-    oppId = game.home_team_id
-  }
-  return getTeamSoSById(oppId)
-}
-
-function formatScore (game) {
-  const hs = game.home_score ?? game.home_points
-  const as = game.away_score ?? game.away_points
-  if (hs == null || as == null) return '—'
-  return `${hs} - ${as}`
-}
-
 function formatNumber (val, digits = 3) {
   if (val == null || Number.isNaN(val)) return '—'
   return Number(val).toFixed(digits)
 }
+
+// ---- CONFERENCE MODAL HELPERS ----
+function openConferenceModal (row) {
+  selectedConferenceName.value = row.conference
+  showConferenceModal.value = true
+}
+
+function closeConferenceModal () {
+  showConferenceModal.value = false
+}
+
+// Teams in the selected conference with rank + avg points per game
+const selectedConferenceTeams = computed(() => {
+  const conf = selectedConferenceName.value
+  if (!conf) return []
+
+  return teamsWithRank.value
+    .filter((t) => (t.conference || 'Independent') === conf)
+    .map((t) => ({
+      ...t,
+      avgPointsFor: getTeamAvgPoints(t.team_id),
+    }))
+    .sort((a, b) => {
+      const ar = a.rank ?? 9999
+      const br = b.rank ?? 9999
+      return ar - br
+    })
+})
 </script>
 
 <template>
@@ -346,13 +422,17 @@ function formatNumber (val, digits = 3) {
       <CCol :md="8">
         <div class="d-flex flex-column gap-1">
           <h2 class="fw-bold mb-0">
-            College Football Teams
+            College Football – Conference Summary
           </h2>
           <p class="text-body-secondary mb-0">
-            Teams from
+            Aggregated by conference using
             <span class="fw-semibold">api.collegefootballranks.com</span>.
-            Click a team to view its games.
           </p>
+          <small class="text-body-secondary">
+            Average rank from <code>/v1/ranker</code>;
+            average point diff vs non-conference opponents and average points
+            per game from <code>/v1/games</code>.
+          </small>
         </div>
       </CCol>
       <CCol
@@ -363,7 +443,7 @@ function formatNumber (val, digits = 3) {
           color="secondary"
           variant="outline"
           size="sm"
-          @click="() => { loadTeams(); loadRankings(); }"
+          @click="() => { loadTeams(); loadRankings(); loadGamesIfNeeded(); }"
         >
           <CIcon icon="cil-reload" class="me-1" />
           Refresh
@@ -373,6 +453,22 @@ function formatNumber (val, digits = 3) {
 
     <!-- STATS CARDS -->
     <CRow class="mb-4 g-3">
+      <CCol :sm="6" :lg="4">
+        <CCard class="h-100 border-0 shadow-sm">
+          <CCardBody class="d-flex flex-column justify-content-between">
+            <div class="text-body-secondary small mb-1">
+              Total Conferences
+            </div>
+            <div class="d-flex align-items-end justify-content-between">
+              <div class="fs-3 fw-bold">
+                {{ totalConferences || '—' }}
+              </div>
+              <CIcon icon="cil-grid" size="xl" class="opacity-50" />
+            </div>
+          </CCardBody>
+        </CCard>
+      </CCol>
+
       <CCol :sm="6" :lg="4">
         <CCard class="h-100 border-0 shadow-sm">
           <CCardBody class="d-flex flex-column justify-content-between">
@@ -393,27 +489,11 @@ function formatNumber (val, digits = 3) {
         <CCard class="h-100 border-0 shadow-sm">
           <CCardBody class="d-flex flex-column justify-content-between">
             <div class="text-body-secondary small mb-1">
-              Conferences
-            </div>
-            <div class="d-flex align-items-end justify-content-between">
-              <div class="fs-3 fw-bold">
-                {{ totalConferences || '—' }}
-              </div>
-              <CIcon icon="cil-grid" size="xl" class="opacity-50" />
-            </div>
-          </CCardBody>
-        </CCard>
-      </CCol>
-
-      <CCol :sm="6" :lg="4">
-        <CCard class="h-100 border-0 shadow-sm">
-          <CCardBody class="d-flex flex-column justify-content-between">
-            <div class="text-body-secondary small mb-1">
               Showing (after filters)
             </div>
             <div class="d-flex align-items-end justify-content-between">
               <div class="fs-3 fw-bold">
-                {{ sortedTeams.length }}
+                {{ sortedConferences.length }}
               </div>
             </div>
           </CCardBody>
@@ -427,10 +507,10 @@ function formatNumber (val, digits = 3) {
         <CRow class="align-items-center g-3">
           <CCol :md="4">
             <div class="fw-semibold">
-              Teams Table
+              Conference Table
             </div>
             <small class="text-body-secondary">
-              Click a row to view that team’s games.
+              Click a conference name to see member teams with rank and scoring.
             </small>
           </CCol>
           <CCol :md="4">
@@ -441,14 +521,14 @@ function formatNumber (val, digits = 3) {
               <CFormInput
                 v-model="searchQuery"
                 type="text"
-                placeholder="Search by team, mascot, or conference..."
+                placeholder="Search by conference name..."
               />
             </CInputGroup>
           </CCol>
           <CCol :md="2">
             <CFormSelect v-model="selectedConference">
               <option
-                v-for="conf in conferences"
+                v-for="conf in conferenceOptions"
                 :key="conf"
                 :value="conf"
               >
@@ -490,7 +570,7 @@ function formatNumber (val, digits = 3) {
           <CButton
             color="primary"
             size="sm"
-            @click="() => { loadTeams(); loadRankings(); }"
+            @click="() => { loadTeams(); loadRankings(); loadGamesIfNeeded(); }"
           >
             Retry
           </CButton>
@@ -508,24 +588,6 @@ function formatNumber (val, digits = 3) {
               <CTableRow>
                 <CTableHeaderCell
                   class="clickable"
-                  @click="changeSort('team_name')"
-                >
-                  Team
-                  <span class="ms-1 small">
-                    {{ sortIcon('team_name') }}
-                  </span>
-                </CTableHeaderCell>
-                <CTableHeaderCell
-                  class="clickable"
-                  @click="changeSort('mascot')"
-                >
-                  Mascot
-                  <span class="ms-1 small">
-                    {{ sortIcon('mascot') }}
-                  </span>
-                </CTableHeaderCell>
-                <CTableHeaderCell
-                  class="clickable"
                   @click="changeSort('conference')"
                 >
                   Conference
@@ -535,11 +597,38 @@ function formatNumber (val, digits = 3) {
                 </CTableHeaderCell>
                 <CTableHeaderCell
                   class="text-center clickable"
-                  @click="changeSort('home_field_equal_team_win_prob')"
+                  @click="changeSort('numTeams')"
                 >
-                  Home-Field Equal-Team Win Prob
+                  # Teams
                   <span class="ms-1 small">
-                    {{ sortIcon('home_field_equal_team_win_prob') }}
+                    {{ sortIcon('numTeams') }}
+                  </span>
+                </CTableHeaderCell>
+                <CTableHeaderCell
+                  class="text-center clickable"
+                  @click="changeSort('avgRank')"
+                >
+                  Avg Rank
+                  <span class="ms-1 small">
+                    {{ sortIcon('avgRank') }}
+                  </span>
+                </CTableHeaderCell>
+                <CTableHeaderCell
+                  class="text-center clickable"
+                  @click="changeSort('avgPointDiff')"
+                >
+                  Avg Point Diff (vs non-conf)
+                  <span class="ms-1 small">
+                    {{ sortIcon('avgPointDiff') }}
+                  </span>
+                </CTableHeaderCell>
+                <CTableHeaderCell
+                  class="text-center clickable"
+                  @click="changeSort('avgPointsFor')"
+                >
+                  Avg Pts/G (Conf)
+                  <span class="ms-1 small">
+                    {{ sortIcon('avgPointsFor') }}
                   </span>
                 </CTableHeaderCell>
               </CTableRow>
@@ -547,42 +636,38 @@ function formatNumber (val, digits = 3) {
 
             <CTableBody>
               <CTableRow
-                v-for="team in paginatedTeams"
-                :key="team.team_id ?? team.team_name"
-                class="cursor-pointer"
-                @click="openTeamGames(team)"
+                v-for="row in paginatedConferences"
+                :key="row.conference"
               >
                 <CTableDataCell>
-                  <div class="fw-semibold d-flex align-items-center gap-2">
-                    <span>{{ team.team_name }}</span>
-                    <span
-                      v-if="team.rank != null"
-                      class="pill-rank"
-                    >
-                      {{ team.rank }}
-                    </span>
-                  </div>
-                </CTableDataCell>
-                <CTableDataCell>
-                  {{ team.mascot }}
-                </CTableDataCell>
-                <CTableDataCell>
-                  <span class="badge text-bg-light border">
-                    {{ team.conference || '—' }}
+                  <span
+                    class="fw-semibold clickable text-primary text-decoration-underline"
+                    @click="openConferenceModal(row)"
+                  >
+                    {{ row.conference }}
                   </span>
                 </CTableDataCell>
                 <CTableDataCell class="text-center">
-                  {{ formatNumber(team.home_field_equal_team_win_prob, 3) }}
+                  {{ row.numTeams }}
+                </CTableDataCell>
+                <CTableDataCell class="text-center">
+                  {{ formatNumber(row.avgRank, 1) }}
+                </CTableDataCell>
+                <CTableDataCell class="text-center">
+                  {{ formatNumber(row.avgPointDiff, 1) }}
+                </CTableDataCell>
+                <CTableDataCell class="text-center">
+                  {{ formatNumber(row.avgPointsFor, 1) }}
                 </CTableDataCell>
               </CTableRow>
 
-              <CTableRow v-if="!paginatedTeams.length">
-                <CTableDataCell colspan="4" class="text-center py-4">
+              <CTableRow v-if="!paginatedConferences.length">
+                <CTableDataCell colspan="5" class="text-center py-4">
                   <div class="fw-semibold mb-1">
-                    No teams match your filters.
+                    No conferences match your filters.
                   </div>
                   <div class="small text-body-secondary">
-                    Try clearing the search or changing the conference.
+                    Try clearing the search or changing the conference filter.
                   </div>
                 </CTableDataCell>
               </CTableRow>
@@ -593,7 +678,7 @@ function formatNumber (val, digits = 3) {
 
       <!-- PAGINATION -->
       <CCardFooter
-        v-if="!loading && !error && sortedTeams.length"
+        v-if="!loading && !error && sortedConferences.length"
         class="d-flex flex-wrap align-items-center justify-content-between gap-2"
       >
         <div class="small text-body-secondary">
@@ -604,14 +689,14 @@ function formatNumber (val, digits = 3) {
           –
           <span class="fw-semibold">
             {{
-              Math.min(currentPage * pageSize, sortedTeams.length)
+              Math.min(currentPage * pageSize, sortedConferences.length)
             }}
           </span>
           of
           <span class="fw-semibold">
-            {{ sortedTeams.length }}
+            {{ sortedConferences.length }}
           </span>
-          teams
+          conferences
         </div>
         <div class="d-flex align-items-center gap-1">
           <CButton
@@ -642,41 +727,38 @@ function formatNumber (val, digits = 3) {
       </CCardFooter>
     </CCard>
 
-    <!-- TEAM GAMES MODAL -->
+    <!-- OPTIONAL NOTE IF GAMES FAILED -->
+    <div
+      v-if="gamesError"
+      class="mt-2 small text-danger"
+    >
+      Note: game data failed to load, so average point differentials and
+      points-per-game metrics may be missing.
+    </div>
+
+    <!-- CONFERENCE TEAMS MODAL -->
     <CModal
-      v-model:visible="showGamesModal"
+      v-model:visible="showConferenceModal"
       size="lg"
       scrollable
     >
       <CModalHeader>
         <CModalTitle>
-          {{ selectedTeam ? selectedTeam.team_name : 'Team' }} – Games
-          <span
-            v-if="selectedTeam && selectedTeam.rank != null"
-            class="pill-rank ms-2"
-          >
-            {{ selectedTeam.rank }}
-          </span>
-          <span
-            v-if="selectedTeam && selectedTeam.sos_score != null"
-            class="ms-3 small text-body-secondary"
-          >
-            SoS: {{ formatNumber(selectedTeam.sos_score, 3) }}
-          </span>
+          {{ selectedConferenceName || 'Conference' }} – Teams
         </CModalTitle>
-        <CButtonClose @click="closeGamesModal" />
+        <CButtonClose @click="closeConferenceModal" />
       </CModalHeader>
       <CModalBody>
         <div v-if="gamesLoading" class="text-center py-3">
           <CSpinner class="me-2" />
-          Loading games…
+          Loading game stats…
         </div>
         <div v-else-if="gamesError" class="text-danger small mb-2">
           {{ gamesError }}
         </div>
         <div v-else>
           <CTable
-            v-if="selectedTeamGames.length"
+            v-if="selectedConferenceTeams.length"
             hover
             striped
             responsive
@@ -685,52 +767,36 @@ function formatNumber (val, digits = 3) {
           >
             <CTableHead class="text-nowrap">
               <CTableRow>
-                <CTableHeaderCell>Date</CTableHeaderCell>
-                <CTableHeaderCell>Home (Rank)</CTableHeaderCell>
-                <CTableHeaderCell>Away (Rank)</CTableHeaderCell>
+                <CTableHeaderCell>Team</CTableHeaderCell>
                 <CTableHeaderCell class="text-center">
-                  Score
+                  Rank
                 </CTableHeaderCell>
                 <CTableHeaderCell class="text-center">
-                  Opp SoS Score
+                  Avg Pts/G
                 </CTableHeaderCell>
               </CTableRow>
             </CTableHead>
             <CTableBody>
               <CTableRow
-                v-for="(game, idx) in selectedTeamGames"
-                :key="game.game_id ?? idx"
+                v-for="team in selectedConferenceTeams"
+                :key="team.team_id ?? team.team_name"
               >
                 <CTableDataCell>
-                  {{ formatGameDate(game) }}
-                </CTableDataCell>
-                <CTableDataCell>
-                  <div class="d-flex align-items-center gap-2">
-                    <span>{{ getHomeTeamName(game) }}</span>
-                    <span
-                      v-if="getTeamRankById(game.home_team_id) != null"
-                      class="pill-rank"
-                    >
-                      {{ getTeamRankById(game.home_team_id) }}
-                    </span>
-                  </div>
-                </CTableDataCell>
-                <CTableDataCell>
-                  <div class="d-flex align-items-center gap-2">
-                    <span>{{ getAwayTeamName(game) }}</span>
-                    <span
-                      v-if="getTeamRankById(game.away_team_id) != null"
-                      class="pill-rank"
-                    >
-                      {{ getTeamRankById(game.away_team_id) }}
-                    </span>
+                  <div class="fw-semibold">
+                    {{ team.team_name }}
                   </div>
                 </CTableDataCell>
                 <CTableDataCell class="text-center">
-                  {{ formatScore(game) }}
+                  <span
+                    v-if="team.rank != null"
+                    class="pill-rank"
+                  >
+                    {{ team.rank }}
+                  </span>
+                  <span v-else>—</span>
                 </CTableDataCell>
                 <CTableDataCell class="text-center">
-                  {{ formatNumber(getOpponentSoS(game), 3) }}
+                  {{ formatNumber(team.avgPointsFor, 1) }}
                 </CTableDataCell>
               </CTableRow>
             </CTableBody>
@@ -740,12 +806,12 @@ function formatNumber (val, digits = 3) {
             v-else
             class="text-body-secondary small text-center py-3"
           >
-            No games found for this team.
+            No teams found for this conference.
           </div>
         </div>
       </CModalBody>
       <CModalFooter>
-        <CButton color="secondary" variant="outline" @click="closeGamesModal">
+        <CButton color="secondary" variant="outline" @click="closeConferenceModal">
           Close
         </CButton>
       </CModalFooter>
@@ -760,10 +826,6 @@ function formatNumber (val, digits = 3) {
 
 .clickable:hover {
   text-decoration: underline;
-}
-
-.cursor-pointer {
-  cursor: pointer;
 }
 
 /* Orange rank pill */

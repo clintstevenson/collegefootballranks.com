@@ -8,17 +8,17 @@ const routes = [
     path: '/',
     name: 'Home',
     component: DefaultLayout,
-    redirect: '/dashboard',
+    redirect: '/Ranker',
     children: [
       {
-        path: '/dashboard',
-        name: 'Dashboard',
+        path: '/ranker',
+        name: 'Ranker',
         // route level code-splitting
         // this generates a separate chunk (about.[hash].js) for this route
         // which is lazy-loaded when the route is visited.
         component: () =>
           import(
-            /* webpackChunkName: "dashboard" */ '@/views/dashboard/Dashboard.vue'
+            /* webpackChunkName: "dashboard" */ '@/views/dashboard/Ranker.vue'
           ),
       },
       {
@@ -41,6 +41,17 @@ const routes = [
         component: () =>
           import(
             /* webpackChunkName: "games" */ '@/views/dashboard/Games.vue'
+          ),
+      },
+      {
+        path: '/conferences',
+        name: 'Conferences',
+        // route level code-splitting
+        // this generates a separate chunk (about.[hash].js) for this route
+        // which is lazy-loaded when the route is visited.
+        component: () =>
+          import(
+            /* webpackChunkName: "games" */ '@/views/dashboard/Conferences.vue'
           ),
       },
       {

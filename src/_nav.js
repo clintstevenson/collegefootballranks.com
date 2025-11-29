@@ -1,8 +1,8 @@
 export default [
   {
     component: 'CNavItem',
-    name: 'Dashboard',
-    to: '/dashboard',
+    name: 'Ranker',
+    to: '/ranker',
     icon: 'cil-speedometer',
   },
   {
@@ -15,6 +15,12 @@ export default [
     component: 'CNavItem',
     name: 'Games',
     to: '/games',
+    icon: 'cil-speedometer',
+  },
+  {
+    component: 'CNavItem',
+    name: 'Conferences',
+    to: '/conferences',
     icon: 'cil-speedometer',
   },
   {

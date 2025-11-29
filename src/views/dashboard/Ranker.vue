@@ -5,22 +5,31 @@ const loading = ref(false)
 const error = ref(null)
 
 const latestGameDate = ref(null)
-const homeFieldAdv = ref(null)
+const homeFieldAdv = ref(null) // existing HFA metric
+const homeFieldAdvProb = ref(null) // global equal-team HFA probability (still used in modal header)
 const rankingsRaw = ref([])
+
+const teamsRaw = ref([])
+const gamesRaw = ref([])
 
 const searchQuery = ref('')
 const selectedConference = ref('ALL')
-const sortKey = ref('rating')
-const sortDirection = ref('desc')
+const sortKey = ref('rank')
+const sortDirection = ref('asc')
 const currentPage = ref(1)
 const pageSize = ref(25)
 
-// ---- API LOAD ----
+// ---- MODAL STATE ----
+const showGamesModal = ref(false)
+const activeTeamId = ref(null) // team_id from the clicked row
+
+// ---- API LOADS ----
 async function loadRankings () {
   loading.value = true
   error.value = null
 
   try {
+    // Using /v1/ranker as the data source
     const res = await fetch('https://api.collegefootballranks.com/v1/ranker', {
       headers: {
         Accept: 'application/json',
@@ -33,11 +42,12 @@ async function loadRankings () {
 
     const json = await res.json()
 
-    // Handle both { raw_ranking: [...] } and plain array just in case
+    // /v1/ranker returns { raw_ranking: [...] } plus globals
     rankingsRaw.value = Array.isArray(json) ? json : (json.raw_ranking || [])
 
     latestGameDate.value = json.latest_game_date || null
     homeFieldAdv.value = json.home_field_adv ?? null
+    homeFieldAdvProb.value = json.home_field_equal_team_win_prob ?? null
   } catch (err) {
     console.error(err)
     error.value = err?.message || 'Unable to load rankings.'
@@ -46,9 +56,90 @@ async function loadRankings () {
   }
 }
 
-onMounted(() => {
-  loadRankings()
+async function loadTeams () {
+  try {
+    const res = await fetch('https://api.collegefootballranks.com/v1/teams', {
+      headers: { Accept: 'application/json' },
+    })
+    if (!res.ok) {
+      throw new Error(`Teams API error: ${res.status} ${res.statusText}`)
+    }
+    const json = await res.json()
+    teamsRaw.value = Array.isArray(json) ? json : (json.teams || [])
+  } catch (err) {
+    console.error(err)
+  }
+}
+
+async function loadGames () {
+  try {
+    const res = await fetch('https://api.collegefootballranks.com/v1/games', {
+      headers: { Accept: 'application/json' },
+    })
+    if (!res.ok) {
+      throw new Error(`Games API error: ${res.status} ${res.statusText}`)
+    }
+    const json = await res.json()
+    gamesRaw.value = Array.isArray(json) ? json : (json.games || [])
+  } catch (err) {
+    console.error(err)
+  }
+}
+
+onMounted(async () => {
+  await Promise.all([loadRankings(), loadTeams(), loadGames()])
 })
+
+// ---- LOOKUP MAPS ----
+const teamsById = computed(() => {
+  const map = Object.create(null)
+  for (const t of teamsRaw.value) {
+    const id = t.team_id ?? t.id
+    if (id != null) {
+      map[String(id)] = t
+    }
+  }
+  return map
+})
+
+// Build a lookup from team_id and team_name to rank + sos_score
+const rankingsLookup = computed(() => {
+  const byId = Object.create(null)
+  const byName = Object.create(null)
+
+  for (const t of rankingsRaw.value) {
+    const id = t.team_id ?? t.id
+    const name = t.team_name
+    const rankVal = t.rank ?? null
+    const sosScore = t.sos_score ?? null
+
+    const payload = { rank: rankVal, sos_score: sosScore }
+
+    if (id != null) {
+      byId[String(id)] = payload
+    }
+    if (name) {
+      byName[name.toLowerCase()] = payload
+    }
+  }
+
+  return { byId, byName }
+})
+
+function getRankingForTeam (teamId, teamName) {
+  const { byId, byName } = rankingsLookup.value
+
+  if (teamId != null && byId[String(teamId)]) {
+    return byId[String(teamId)]
+  }
+
+  if (teamName) {
+    const key = teamName.toLowerCase()
+    if (byName[key]) return byName[key]
+  }
+
+  return { rank: null, sos_score: null }
+}
 
 // ---- DERIVED METRICS ----
 const totalTeams = computed(() => rankingsRaw.value.length)
@@ -70,7 +161,6 @@ const filteredTeams = computed(() => {
 
   return rankingsRaw.value.filter((team) => {
     if (conf !== 'ALL' && team.conference !== conf) return false
-
     if (!q) return true
 
     const haystack = [
@@ -87,13 +177,14 @@ const filteredTeams = computed(() => {
 })
 
 const numericSortKeys = new Set([
-  'ranking',
+  'rank',
   'wins',
   'losses',
   'games',
   'win_pct',
-  'rating',
-  'base_rating',
+  'sos_tough_opponents',
+  'sos_score',
+  'home_field_equal_team_win_prob',
 ])
 
 const sortedTeams = computed(() => {
@@ -103,14 +194,16 @@ const sortedTeams = computed(() => {
   const arr = [...filteredTeams.value]
 
   arr.sort((a, b) => {
-    const aVal =
-      key === 'ranking'
-        ? (a.ranking ?? a.rank ?? 9999)
-        : a[key]
-    const bVal =
-      key === 'ranking'
-        ? (b.ranking ?? b.rank ?? 9999)
-        : b[key]
+    let aVal
+    let bVal
+
+    if (key === 'rank') {
+      aVal = a.rank ?? 9999
+      bVal = b.rank ?? 9999
+    } else {
+      aVal = a[key]
+      bVal = b[key]
+    }
 
     if (numericSortKeys.has(key)) {
       const aNum = Number(aVal ?? 0)
@@ -142,13 +235,68 @@ watch([searchQuery, selectedConference, pageSize], () => {
   currentPage.value = 1
 })
 
+// ---- MODAL: ACTIVE TEAM INFO ----
+const activeTeamName = computed(() => {
+  if (activeTeamId.value == null) return ''
+  const idStr = String(activeTeamId.value)
+  const fromRanker = rankingsRaw.value.find(
+    (t) => String(t.team_id ?? t.id) === idStr,
+  )
+  if (fromRanker?.team_name) return fromRanker.team_name
+
+  const fromTeams = teamsById.value[idStr]
+  return fromTeams?.team_name || fromTeams?.name || ''
+})
+
+const activeTeamGames = computed(() => {
+  if (activeTeamId.value == null) return []
+
+  const idStr = String(activeTeamId.value)
+
+  return gamesRaw.value
+    .filter(
+      (g) =>
+        String(g.home_team_id) === idStr ||
+        String(g.away_team_id) === idStr,
+    )
+    .map((g) => {
+      const isHome = String(g.home_team_id) === idStr
+      const oppTeamId = isHome ? g.away_team_id : g.home_team_id
+
+      const homeTeam = teamsById.value[String(g.home_team_id)] || {}
+      const awayTeam = teamsById.value[String(g.away_team_id)] || {}
+
+      const oppTeam = isHome ? awayTeam : homeTeam
+
+      const oppRanking = getRankingForTeam(
+        oppTeamId,
+        oppTeam.team_name || oppTeam.name,
+      )
+
+      const dateRaw = g.game_date || g.date
+      const dateObj = dateRaw ? new Date(dateRaw) : new Date(NaN)
+
+      return {
+        ...g,
+        dateObj,
+        isHome,
+        homeName: homeTeam.team_name || homeTeam.name || `Team ${g.home_team_id}`,
+        awayName: awayTeam.team_name || awayTeam.name || `Team ${g.away_team_id}`,
+        oppName: oppTeam.team_name || oppTeam.name || `Team ${oppTeamId}`,
+        oppRank: oppRanking.rank,
+        oppSosScore: oppRanking.sos_score,
+      }
+    })
+    .sort((a, b) => b.dateObj - a.dateObj) // DESC on Date
+})
+
 // ---- UI HELPERS ----
 function changeSort (key) {
   if (sortKey.value === key) {
     sortDirection.value = sortDirection.value === 'asc' ? 'desc' : 'asc'
   } else {
     sortKey.value = key
-    sortDirection.value = key === 'ranking' ? 'asc' : 'desc'
+    sortDirection.value = key === 'rank' ? 'asc' : 'desc'
   }
 }
 
@@ -173,9 +321,14 @@ function formatRecord (team) {
   return `${w}-${l}`
 }
 
-function formatRating (val) {
+function formatNumber (val, digits = 3) {
   if (val == null) return '–'
-  return Number(val).toFixed(3)
+  return Number(val).toFixed(digits)
+}
+
+function formatInteger (val) {
+  if (val == null) return '–'
+  return Math.round(Number(val))
 }
 
 function formatDate (d) {
@@ -187,6 +340,13 @@ function formatDate (d) {
     month: 'short',
     day: 'numeric',
   })
+}
+
+function openTeamModal (team) {
+  const id = team.team_id ?? team.id
+  if (id == null) return
+  activeTeamId.value = id
+  showGamesModal.value = true
 }
 </script>
 
@@ -200,7 +360,8 @@ function formatDate (d) {
             College Football Model Rankings
           </h2>
           <p class="text-body-secondary mb-0">
-            Live rankings powered by <span class="fw-semibold">api.collegefootballranks.com</span>.
+            Live rankings powered by
+            <span class="fw-semibold">api.collegefootballranks.com</span>.
             Sort, search, and slice the field by conference.
           </p>
           <small class="text-body-secondary">
@@ -217,7 +378,7 @@ function formatDate (d) {
           color="secondary"
           variant="outline"
           size="sm"
-          @click="loadRankings"
+          @click="() => { loadRankings(); loadGames(); loadTeams(); }"
         >
           <CIcon icon="cil-reload" class="me-1" />
           Refresh
@@ -285,7 +446,6 @@ function formatDate (d) {
               <div class="fs-3 fw-bold">
                 {{ sortedTeams.length }}
               </div>
-              
             </div>
           </CCardBody>
         </CCard>
@@ -361,7 +521,7 @@ function formatDate (d) {
           <CButton
             color="primary"
             size="sm"
-            @click="loadRankings"
+            @click="() => { loadRankings(); loadGames(); loadTeams(); }"
           >
             Retry
           </CButton>
@@ -379,11 +539,11 @@ function formatDate (d) {
               <CTableRow>
                 <CTableHeaderCell
                   class="text-center clickable"
-                  @click="changeSort('ranking')"
+                  @click="changeSort('rank')"
                 >
                   #
                   <span class="ms-1 small">
-                    {{ sortIcon('ranking') }}
+                    {{ sortIcon('rank') }}
                   </span>
                 </CTableHeaderCell>
                 <CTableHeaderCell
@@ -424,20 +584,29 @@ function formatDate (d) {
                 </CTableHeaderCell>
                 <CTableHeaderCell
                   class="text-center clickable"
-                  @click="changeSort('rating')"
+                  @click="changeSort('home_field_equal_team_win_prob')"
                 >
-                  Rating
+                  HFA Prob
                   <span class="ms-1 small">
-                    {{ sortIcon('rating') }}
+                    {{ sortIcon('home_field_equal_team_win_prob') }}
                   </span>
                 </CTableHeaderCell>
                 <CTableHeaderCell
                   class="text-center clickable"
-                  @click="changeSort('base_rating')"
+                  @click="changeSort('sos_tough_opponents')"
                 >
-                  Base Rating
+                  SoS Tough Opp.
                   <span class="ms-1 small">
-                    {{ sortIcon('base_rating') }}
+                    {{ sortIcon('sos_tough_opponents') }}
+                  </span>
+                </CTableHeaderCell>
+                <CTableHeaderCell
+                  class="text-center clickable"
+                  @click="changeSort('sos_score')"
+                >
+                  SoS Score
+                  <span class="ms-1 small">
+                    {{ sortIcon('sos_score') }}
                   </span>
                 </CTableHeaderCell>
               </CTableRow>
@@ -449,9 +618,9 @@ function formatDate (d) {
                 :key="team.team_id ?? team.team_name ?? idx"
               >
                 <CTableDataCell class="text-center fw-semibold">
-                  {{ team.ranking ?? team.rank ?? (idx + 1 + (currentPage - 1) * pageSize) }}
+                  {{ team.rank ?? (idx + 1 + (currentPage - 1) * pageSize) }}
                 </CTableDataCell>
-                <CTableDataCell>
+                <CTableDataCell class="clickable" @click="openTeamModal(team)">
                   <div class="fw-semibold">
                     {{ team.team_name }}
                   </div>
@@ -476,15 +645,25 @@ function formatDate (d) {
                   {{ formatWinPct(team) }}
                 </CTableDataCell>
                 <CTableDataCell class="text-center">
-                  {{ formatRating(team.rating) }}
+                  <!-- HFA probability per team, 2 decimals -->
+                  {{
+                    team.home_field_equal_team_win_prob != null
+                      ? Number(team.home_field_equal_team_win_prob).toFixed(2)
+                      : '–'
+                  }}
                 </CTableDataCell>
                 <CTableDataCell class="text-center">
-                  {{ formatRating(team.base_rating) }}
+                  <!-- integer SoS Tough Opp. -->
+                  {{ formatInteger(team.sos_tough_opponents) }}
+                </CTableDataCell>
+                <CTableDataCell class="text-center">
+                  <!-- SoS score to 2 decimals -->
+                  {{ formatNumber(team.sos_score, 2) }}
                 </CTableDataCell>
               </CTableRow>
 
               <CTableRow v-if="!paginatedTeams.length">
-                <CTableDataCell colspan="7" class="text-center py-4">
+                <CTableDataCell colspan="8" class="text-center py-4">
                   <div class="fw-semibold mb-1">
                     No teams match your filters.
                   </div>
@@ -510,9 +689,7 @@ function formatDate (d) {
           </span>
           –
           <span class="fw-semibold">
-            {{
-              Math.min(currentPage * pageSize, sortedTeams.length)
-            }}
+            {{ Math.min(currentPage * pageSize, sortedTeams.length) }}
           </span>
           of
           <span class="fw-semibold">
@@ -548,6 +725,108 @@ function formatDate (d) {
         </div>
       </CCardFooter>
     </CCard>
+
+    <!-- GAMES MODAL -->
+    <CModal
+      :visible="showGamesModal"
+      size="lg"
+      alignment="center"
+      scrollable
+      @close="showGamesModal = false"
+    >
+      <CModalHeader>
+        <CModalTitle>
+          Games for
+          <span class="fw-semibold">{{ activeTeamName || 'Selected Team' }}</span>
+          <!-- show global HFA probability in modal for context -->
+          <span
+            v-if="homeFieldAdvProb != null"
+            class="ms-3 small text-body-secondary"
+          >
+            HFA Prob (equal teams):
+            <span class="fw-semibold">
+              {{ homeFieldAdvProb.toFixed(3) }}
+            </span>
+          </span>
+        </CModalTitle>
+      </CModalHeader>
+      <CModalBody>
+        <div v-if="!activeTeamGames.length" class="text-center text-body-secondary py-3">
+          No games found for this team.
+        </div>
+        <div v-else>
+          <CTable
+            striped
+            hover
+            small
+            responsive
+            align="middle"
+          >
+            <CTableHead class="text-nowrap bg-body-secondary bg-opacity-50">
+              <CTableRow>
+                <CTableHeaderCell>Date</CTableHeaderCell>
+                <CTableHeaderCell>Home Team</CTableHeaderCell>
+                <CTableHeaderCell>Away Team</CTableHeaderCell>
+                <CTableHeaderCell class="text-center">Score</CTableHeaderCell>
+                <CTableHeaderCell>Opponent (Rank)</CTableHeaderCell>
+                <CTableHeaderCell class="text-center">Opp SoS Score</CTableHeaderCell>
+              </CTableRow>
+            </CTableHead>
+            <CTableBody>
+              <CTableRow
+                v-for="g in activeTeamGames"
+                :key="g.game_id ?? g.id"
+              >
+                <CTableDataCell>
+                  {{ formatDate(g.game_date || g.date) }}
+                </CTableDataCell>
+                <CTableDataCell>
+                  {{ g.homeName }}
+                </CTableDataCell>
+                <CTableDataCell>
+                  {{ g.awayName }}
+                </CTableDataCell>
+                <CTableDataCell class="text-center">
+                  <span class="fw-semibold">
+                    {{ g.home_score }} – {{ g.away_score }}
+                  </span>
+                </CTableDataCell>
+                <CTableDataCell>
+                  <span class="fw-semibold">
+                    {{ g.oppName }}
+                  </span>
+                  <span v-if="g.oppRank != null" class="ms-2">
+                    <span
+                      :class="[
+                        'rank-pill',
+                        g.oppRank >= 1 && g.oppRank <= 25
+                          ? 'rank-pill-top25'
+                          : 'rank-pill-other'
+                      ]"
+                    >
+                      {{ g.oppRank }}
+                    </span>
+                  </span>
+                  <span v-else class="ms-2 text-body-secondary">–</span>
+                </CTableDataCell>
+                <CTableDataCell class="text-center">
+                  {{
+                    g.oppSosScore != null
+                      ? formatNumber(g.oppSosScore, 2)
+                      : '–'
+                  }}
+                </CTableDataCell>
+              </CTableRow>
+            </CTableBody>
+          </CTable>
+        </div>
+      </CModalBody>
+      <CModalFooter>
+        <CButton color="secondary" @click="showGamesModal = false">
+          Close
+        </CButton>
+      </CModalFooter>
+    </CModal>
   </div>
 </template>
 
@@ -558,5 +837,25 @@ function formatDate (d) {
 
 .clickable:hover {
   text-decoration: underline;
+}
+
+/* Rank pills in modal */
+.rank-pill {
+  border-radius: 999px;
+  padding: 0.15rem 0.5rem;
+  font-size: 0.75rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.rank-pill-top25 {
+  background-color: #fd7e14; /* orange */
+  color: #fff;
+}
+
+.rank-pill-other {
+  background-color: #343a40; /* dark gray */
+  color: #fff;
 }
 </style>
